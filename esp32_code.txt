@@ -1,0 +1,240 @@
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <LiquidCrystal_I2C.h>
+#include <SoftwareSerial.h>
+
+Adafruit_BME280 bme;
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);  // set the LCD address to 0x27 for a 16 chars and 2 line display
+SoftwareSerial pmsSerial(13, 14);    // tells the esp which pins to look at for the bme
+
+const int smokeSensor = 4;  // tells the esp which pin to look at when analogue reading
+int aqi = 0;                // initialises aqi variable
+
+int AQIValues[11] = { 0, 50, 100, 150, 200, 300, 500 };
+
+float mq135Breakpoints[6] = { 0, 200, 400, 600, 800, 1000 };  // MQ-135 sensor AQI breakpoints and values for Ireland
+int mq135AQIValues[11] = { 0, 50, 100, 150, 200, 300, 500 };
+
+float pm25Breakpoints[6] = { 0, 12, 35, 55, 150, 250 };  // PM2.5 sensor AQI breakpoints and values for Ireland
+int pm25AQIValues[11] = { 0, 50, 100, 150, 200, 300, 500 };
+
+float pm10Breakpoints[6] = { 0, 16, 33, 50, 150, 250 };  // PM10 sensor AQI breakpoints and values for Ireland
+int pm10AQIValues[11] = { 0, 50, 100, 150, 200, 300, 500 };
+
+void setup() {
+  Serial.begin(115200);
+
+  pmsSerial.begin(9600);  // bme sensor baud rate is 9600 as standard
+
+  Serial.print('Connected!');
+
+  lcd.init();  // initialises the screen
+  lcd.backlight();
+
+  if (!bme.begin(0x76)) {  // looks for bme sesnor, throws up error if nothing is found
+    Serial.println("Could not find a valid BME280 sensor, check wiring, address, sensor ID!");
+    while (1)
+      ;
+  }
+}
+
+struct pms5003data {  // defines the data points for all of the possible inputs from the bme sensor.
+  uint16_t framelen;
+  uint16_t pm10_standard, pm25_standard, pm100_standard;
+  uint16_t pm10_env, pm25_env, pm100_env;
+  uint16_t particles_03um, particles_05um, particles_10um, particles_25um, particles_50um, particles_100um;
+  uint16_t unused;
+  uint16_t checksum;
+};
+
+struct pms5003data data;
+
+void loop() {
+
+  output_serial();  //sends data to serial to be collected into csv
+
+  LCD_1();  // first page of lcd screen
+  delay(5000);
+  lcd.clear();
+
+  LCD_2();  // second page of lcd
+  delay(5000);
+  lcd.clear();
+}
+
+void output_serial() {
+
+  readPMSdata(&pmsSerial);
+
+  // reads in from all my sensors
+  float mq135Reading = analogRead(smokeSensor);
+  float pm25Concentration = data.particles_25um;
+  float pm10Concentration = data.particles_10um;
+
+  aqi = calcAQI(mq135Reading, pm25Concentration, pm10Concentration);
+
+  Serial.print(bme.readTemperature());
+  Serial.print(",");
+
+  Serial.print(bme.readPressure() / 100.0F);
+  Serial.print(",");
+
+  Serial.print(bme.readHumidity());
+  Serial.print(",");
+
+  Serial.print(mq135Reading);
+  Serial.print(",");
+
+  Serial.print(pm25Concentration);
+  Serial.print(",");
+
+  Serial.print(aqi);
+  Serial.print("\n");
+}
+void LCD_2() {  // page 1 of screen
+  lcd.setCursor(0, 0);
+  lcd.print("Temp: ");
+  lcd.print(bme.readTemperature());
+  lcd.println(" *C");
+
+
+  lcd.setCursor(0, 1);
+  lcd.print("Pressure: ");
+  lcd.print(bme.readPressure() / 100.0F);
+  lcd.println(" hPa");
+
+
+  lcd.setCursor(0, 2);
+  lcd.print("Humidity: ");
+  lcd.print(bme.readHumidity());
+  lcd.println(" %");
+}
+
+void LCD_1() {  // page 2 of screen
+
+  readPMSdata(&pmsSerial);
+
+  // reads in from all my sensors
+  float mq135Reading = analogRead(smokeSensor);
+  float pm25Concentration = data.particles_25um;
+  float pm10Concentration = data.particles_10um;
+
+  aqi = calcAQI(mq135Reading, pm25Concentration, pm10Concentration);
+
+  lcd.setCursor(0, 0);  // tells the screen where to begin the text from
+  lcd.print("Gas Content: ");
+  lcd.print(mq135Reading);
+
+  lcd.setCursor(0, 1);
+  lcd.print("PM2.5: ");
+  lcd.print(int(pm25Concentration));
+  lcd.setCursor(11, 1);
+  lcd.print("PM10: ");
+  lcd.print(int(pm10Concentration));
+
+  lcd.setCursor(0, 2);
+  lcd.print("AQI: ");
+  lcd.print(aqi);
+
+  lcd.setCursor(0, 3);
+  lcd.print("Quality: ");
+  printAqiLevel(aqi);
+}
+
+
+void printAqiLevel(int aqi) {  
+// returns a indication of air quality based on the EPA's Air Quality Index
+  if (1 <= aqi && aqi <= 50) {
+    lcd.print("Good");
+  } else if (51 <= aqi && aqi <= 100) {
+    lcd.print("Moderate");
+  } else if (101 <= aqi && aqi <= 200) {
+    lcd.print("Unhealthy");
+  } else if (201 <= aqi && aqi <= 300) {
+    lcd.print("Very Unhealthy");
+  } else if (301 <= aqi && aqi <= 500) {
+    lcd.print("Hazardous");
+  } else {
+    lcd.print("Invalid AQI");
+  }
+}
+
+
+boolean readPMSdata(Stream *s) {  // reads in data from the Particulate Matter sensor. The data is read in a very weird format so this code formats it in a way that I can display it easily.
+  if (!s->available()) {
+    return false;
+  }
+
+  // Read a byte at a time until it gets to the special '0x42' start-byte
+  if (s->peek() != 0x42) {
+    s->read();
+    return false;
+  }
+
+  // Reads all 32 bytes
+  if (s->available() < 32) {
+    return false;
+  }
+
+  uint8_t buffer[32];
+  uint16_t sum = 0;
+  s->readBytes(buffer, 32);
+
+  // get checksum ready
+  for (uint8_t i = 0; i < 30; i++) {
+    sum += buffer[i];
+  }
+
+  // The data comes in endian'd, this solves it so it works on all platforms
+  uint16_t buffer_u16[15];
+  for (uint8_t i = 0; i < 15; i++) {
+    buffer_u16[i] = buffer[2 + i * 2 + 1];
+    buffer_u16[i] += (buffer[2 + i * 2] << 8);
+  }
+
+  // put it into a nice structure
+  memcpy((void *)&data, (void *)buffer_u16, 30);
+
+  if (sum != data.checksum) {
+    Serial.println("Checksum failure");
+    return false;
+  }
+  // success
+  return true;
+}
+
+
+int calculateGenericAQI(float concentration, float breakpoints[]) {
+  // calculates an AQI score based on linear segmented principle and using national breakpoints.
+  int i = 0;
+  int aqi = 0;
+  while (i < 5 && concentration > breakpoints[i + 1]) {
+    i++;
+  }
+
+  // linear segmented principle
+  float I_HI = AQIValues[i + 1];
+  float I_LO = AQIValues[i];
+  float B_HI = breakpoints[i + 1];
+  float B_LO = breakpoints[i];
+
+  // formula I found for calculating AQI
+  aqi = round(((I_HI - I_LO) / (B_HI - B_LO)) * (concentration - B_LO) + I_LO);
+
+  return aqi;
+}
+
+int calcAQI(float mq, float pm25, float pm10) {
+
+  // Calculate AQI score for each pollutant
+  int mq135AQI = calculateGenericAQI(mq, mq135Breakpoints);
+  int pm25AQI = calculateGenericAQI(pm25, pm25Breakpoints);
+  int pm10AQI = calculateGenericAQI(pm10, pm10Breakpoints);
+
+  // agregates the three aqi values and gives more weight to the PM values
+  int compositeAQI = ((mq135AQI / 5) + pm25AQI + pm10AQI) / 3;
+
+  return compositeAQI;
+}
